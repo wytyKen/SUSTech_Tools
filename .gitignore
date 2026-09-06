@@ -1,3 +1,6 @@
 __pycache__/
 user.txt
 course.txt
+build/
+dist/
+*.spec
