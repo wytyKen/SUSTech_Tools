@@ -74,8 +74,8 @@ def load_course():
 
 def cas_login(sid, pwd):
     """ 用于和南科大CAS认证交互，拿到tis的有效cookie
-    输入用于CAS登录的用户名密码，输出tis需要的全部cookie内容(返回头Set-Cookie段的route和jsessionid)
-    我的requests的session不吃CAS重定向给到的cookie，不知道是代码哪里的问题，所以就手动拿了 """
+    输入用于CAS登录的用户名密码，输出tis需要的SESSION cookie内容
+    2026-09起TIS不再下发route/JSESSIONID，改为Spring Session的SESSION cookie """
     print(INFO + "测试CAS链接...")
     try:  # Login 服务的CAS链接有时候会变
         login_url = "https://cas.sustech.edu.cn/cas/login?service=https%3A%2F%2Ftis.sustech.edu.cn%2Fcas"
@@ -84,7 +84,7 @@ def cas_login(sid, pwd):
         print(SUCCESS + "成功连接到CAS...")
     except Exception as ex:
         print(ERROR + f"不能访问CAS, 请检查您的网络连接状态 ({ex})")
-        return "", ""
+        return ""
     print(INFO + "登录中...")
     data = {  # execution大概是CAS中前端session id之类的东西
         'username': sid,
@@ -102,11 +102,16 @@ def cas_login(sid, pwd):
         print(SUCCESS + "登录成功")
     else:
         print(ERROR + "用户名或密码错误，请检查")
-        return "", ""
-    req = requests.get(req.headers["Location"], allow_redirects=False, headers=head, verify=False)
-    _route = findall('route=(.+?);', req.headers["Set-Cookie"])[0]
-    _jsessionid = findall('JSESSIONID=(.+?);', req.headers["Set-Cookie"])[0]
-    return _route, _jsessionid
+        return ""
+    # 2026-09 TIS升级为Spring Session，CAS回跳后下发的是SESSION cookie(不再是route/JSESSIONID)
+    # 用Session跟随全部重定向以累积每一跳的Set-Cookie，再从cookie池提取SESSION
+    sess = requests.Session()
+    res = sess.get(req.headers["Location"], headers=head, verify=False)
+    _session = sess.cookies.get("SESSION")
+    if not _session or "cas.sustech.edu.cn" in res.url:
+        print(ERROR + "TIS未返回有效会话(SESSION)，接口可能又有变动")
+        return ""
+    return _session
 
 
 def getinfo(semester_data):
@@ -140,11 +145,29 @@ def getinfo(semester_data):
             "pageSize": 1000  # 每学期总共开课在1000左右，所以单分类可以包括学期的全部课程
         }
         print("[\x1b[0;36m*\x1b[0m] " + f"获取 {COURSE_TYPE[c_type]} 列表...")
-        req = requests.post('https://tis.sustech.edu.cn/Xsxk/queryKxrw', data=data, headers=head, verify=False)
-        raw_class_data = loads(req.text)
-        if raw_class_data.get('kxrwList'):
-            for i in raw_class_data['kxrwList']['list']:
+        # 2026-09 TIS启用了用户级查询限流(返回"查询请求频率过高")，需要等待退避重试
+        attempt, _kxrw = 0, None
+        while True:
+            req = requests.post('https://tis.sustech.edu.cn/Xsxk/queryKxrw', data=data, headers=head, verify=False)
+            raw_class_data = loads(req.text)
+            if raw_class_data.get('jg') == '-1' or '频率过高' in str(raw_class_data.get('message', '')):
+                attempt += 1
+                if attempt > 15:
+                    print(FAIL + f"  {c_type} 多次重试仍被限流，暂时跳过(删除{COURSE_INFO_PATH}后重跑可补齐)")
+                    break
+                _wait = min(3 + attempt * 2, 15)
+                print(f"    [!] {c_type} 被限流，{_wait}秒后重试(第{attempt}次)...")
+                time.sleep(_wait)
+                continue
+            _kxrw = raw_class_data.get('kxrwList')
+            break
+        if _kxrw and _kxrw.get('list') is not None:
+            print(f"    [+] {c_type}: 返回{len(_kxrw['list'])}门 (total={_kxrw.get('total')})")
+            for i in _kxrw['list']:
                 _course_info[i['rwmc']] = (i['id'], c_type)
+        else:
+            print(f"    [debug] {c_type}: 未返回课程列表")
+        time.sleep(2)  # 类别之间稍作间隔，降低触发限流的概率
     print(SUCCESS + f"课程信息读取完毕，共读取{str(len(_course_info))}门课程信息")
     s = input(INFO + "是否保存读取的课程信息（y/N）？")
     if s in "yY":
@@ -182,9 +205,12 @@ def submit(semester_data, loop=3):
             course_list.pop(0)
         else:
             print("[\x1b[0;30m-\x1b[0m]\t\t\t" + res, flush=True)
-        if any(map(lambda x: x in req.text, ["冲突", "已选", "已满"])):
+        # 注意:此处不能包含"已选"——叠加抢同一门课时,后到的重复请求会返回"已选"并误删队列中的下一门课
+        if any(map(lambda x: x in req.text, ["冲突", "已满"])):
             print(f"[\x1b[0;31m!\x1b[0m] ({c_name})因为({res})跳过", flush=True)
             course_list.pop(0)
+        if "频率过高" in req.text:
+            time.sleep(3)  # 被限流时额外等待，避免连续请求持续触发限制
         time.sleep(TIMEOUT)
         
         
@@ -216,9 +242,12 @@ def submit_sequential(semester_data):
                 course_list.remove(course)
             else:
                 print("[\x1b[0;30m-\x1b[0m]\t\t\t" + res, flush=True)
-            if any(map(lambda x: x in req.text, ["冲突", "已选", "已满"])):
+            # 同上,不含"已选",避免并发重复请求误删队列中的后续课程
+            if any(map(lambda x: x in req.text, ["冲突", "已满"])):
                 print(f"[\x1b[0;31m!\x1b[0m] ({c_name})因为({res})跳过", flush=True)
                 course_list.remove(course)
+            if "频率过高" in req.text:
+                time.sleep(3)  # 被限流时额外等待，避免连续请求持续触发限制
             time.sleep(TIMEOUT)
 
 
@@ -232,36 +261,46 @@ if __name__ == '__main__':
     init(autoreset=True)  # 某窗口系统的优质终端并不直接支持如下转义彩色字符，所以需要一些库来帮忙
     course_name_list = load_course()  # 读取本地待喵的课程
     # 下面是CAS登录
-    route, jsessionid = "", ""
+    session_id = ""
     if os.path.exists(USER_INFO_PATH): # 如果有保存的用户信息，尝试从文件自动登录
         try:
             with open(USER_INFO_PATH, "r", encoding="utf8") as f:
                 lines = f.read().splitlines()
                 if len(lines) >= 2:
                     user_name, pass_word = lines[0], lines[1]
-                    route, jsessionid = cas_login(user_name, pass_word)
+                    session_id = cas_login(user_name, pass_word)
         except Exception as e:
             print(FAIL + f"自动登录出现异常: {e}")
-        if route == "" or jsessionid == "":
+        if session_id == "":
             print(FAIL + "自动登录失败，需要手动登录")
 
-    while route == "" or jsessionid == "":
+    while session_id == "":
         user_name = input("请输入您的学号：")  # getpass在PyCharm里不能正常工作，请改为input或写死
         pass_word = getpass("请输入CAS密码（密码不显示，输入完按回车即可）：")
-        route, jsessionid = cas_login(user_name, pass_word)
-        if route == "" or jsessionid == "":
+        session_id = cas_login(user_name, pass_word)
+        if session_id == "":
             print(FAIL + "请重试...")
         else: # 登录成功后询问保存
             s = input(INFO + "是否保存用户信息（y/N）？")
             if s.lower() in {"y", "yes"}:
                 with open(USER_INFO_PATH, "w", encoding="utf8") as f:
                     f.write(f"{user_name}\n{pass_word}")
-    head['cookie'] = f'route={route}; JSESSIONID={jsessionid};'
+    head['cookie'] = f'SESSION={session_id};'
     # 下面先获取当前的学期
     print(INFO + "从服务器获取当前喵课时间...")
-    semester_info = loads(
-        requests.post('https://tis.sustech.edu.cn/Xsxk/queryXkdqXnxq',
-                      data={"mxpylx": 1}, headers=head, verify=False).text)  # 这里要加mxpylx才能获取到选课所在最新学期
+    semester_info = None
+    for _try in range(10):  # 这里要加mxpylx才能获取到选课所在最新学期；限流时退避重试
+        _raw = loads(requests.post('https://tis.sustech.edu.cn/Xsxk/queryXkdqXnxq',
+                                   data={"mxpylx": 1}, headers=head, verify=False).text)
+        if _raw.get('jg') == '-1' or '频率过高' in str(_raw.get('message', '')):
+            print(FAIL + " 学期查询被限流，5秒后重试...")
+            time.sleep(5)
+            continue
+        semester_info = _raw
+        break
+    if semester_info is None:
+        print(ERROR + "无法获取学期信息，请稍后重跑")
+        exit()
     print(SUCCESS + f"当前学期是{semester_info['p_xn']}学年第{semester_info['p_xq']}学期，为"
                     f"{['', '秋季', '春季', '小'][int(semester_info['p_xq'])]}学期")
     # 然后获取本学期全部课程信息
